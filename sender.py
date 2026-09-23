@@ -1,178 +1,110 @@
-"""Run on each camera Pi. USB camera by default; --backend picamera2 for CSI."""
+"""
+카메라 3대를 동시(같은 시각)가 아니라, cam1 -> cam2 -> cam3 순서로
+약 0.03초(기본값) 간격을 두고 순차적으로 촬영하는 스크립트.
+
+- 각 라운드(round)마다 cam1 -> 0.03초 대기 -> cam2 -> 0.03초 대기 -> cam3 순으로 촬영
+- 촬영된 각 프레임은 실제 촬영 시각(perf_counter 기준, epoch 기준 둘 다)을 기록
+- 이미지 파일과 함께 timestamps.csv 로 각 프레임의 정확한 촬영 시각을 저장
+  (완벽히 0.03초를 보장하지는 않음. sleep/카메라 read 지연에 따라 오차가 있을 수 있음.
+   오차 정도를 확인하고 싶다면 timestamps.csv의 실제 time_epoch 값 차이를 보면 됨)
+
+사용 예:
+    python capture_staggered_cameras.py --num-rounds 100 --interval 0.03 \
+        --cam-indices 0 1 2 --out-dir ./captured_data
+"""
+
 import argparse
-import logging
-from pathlib import Path
-import socket
-import threading
+import csv
+import os
 import time
+from datetime import datetime
 
-from protocol import pack_frame, read_exact
-
-
-class LatestCamera:
-    def __init__(self, args, cv2):
-        self.cv2 = cv2
-        self.backend = args.backend
-        self.condition = threading.Condition()
-        self.frame = None
-        self.sequence = 0
-        self.error = None
-        self.stop = threading.Event()
-        if args.backend == 'picamera2':
-            from picamera2 import Picamera2
-            self.camera = Picamera2()
-            # Picamera2 RGB888 arrays use B,G,R byte order, compatible with OpenCV.
-            self.camera.configure(self.camera.create_video_configuration(
-                main={'size': (320, 240), 'format': 'RGB888'},
-                controls={'FrameRate': args.fps}, buffer_count=4))
-            self.camera.start()
-        else:
-            self.camera = cv2.VideoCapture(args.camera)
-            if not self.camera.isOpened():
-                self.camera.release()
-                raise RuntimeError('Cannot open USB camera')
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-            self.camera.set(cv2.CAP_PROP_FPS, args.fps)
-            self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.thread = threading.Thread(target=self._capture, daemon=True)
-        self.thread.start()
-
-    def _capture(self):
-        try:
-            while not self.stop.is_set():
-                if self.backend == 'picamera2':
-                    frame = self.camera.capture_array('main')
-                else:
-                    ok, frame = self.camera.read()
-                    if not ok:
-                        raise RuntimeError('Camera frame capture failed')
-                captured_ns = time.time_ns()
-                frame = self.cv2.resize(frame, (320, 240))
-                with self.condition:
-                    self.frame = (frame, captured_ns)
-                    self.sequence += 1
-                    self.condition.notify_all()
-        except Exception as exc:
-            with self.condition:
-                self.error = exc
-                self.condition.notify_all()
-
-    def get(self, previous):
-        with self.condition:
-            ready = self.condition.wait_for(
-                lambda: self.error or self.sequence != previous, timeout=5)
-            if self.error:
-                raise RuntimeError('Camera stopped') from self.error
-            if not ready:
-                raise RuntimeError('Camera timed out')
-            return self.sequence, self.frame
-
-    def close(self):
-        self.stop.set()
-        self.thread.join(timeout=2)
-        if self.thread.is_alive():
-            logging.warning('Camera read is blocked; process exit will release device')
-            return
-        if self.backend == 'picamera2':
-            self.camera.stop()
-            self.camera.close()
-        else:
-            self.camera.release()
+import cv2
 
 
-def add_camera_arguments(parser):
-    parser.add_argument('--backend', choices=('usb', 'picamera2'), default='usb')
-    parser.add_argument('--camera', type=int, default=0)
-    parser.add_argument('--model', default='models/hand_landmarker.task')
-    parser.add_argument('--fps', type=int, default=15)
-    parser.add_argument('--hands', type=int, choices=(1, 2), default=2)
+def open_cameras(cam_indices):
+    caps = []
+    for idx in cam_indices:
+        cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            for opened in caps:
+                opened.release()
+            raise RuntimeError(f"카메라 인덱스 {idx} 를 열 수 없습니다.")
+        caps.append(cap)
+    return caps
 
 
-class HandTracker:
-    """Shared camera/inference pipeline for the local master and remote senders."""
-    def __init__(self, args):
-        self.args = args
-        self.camera = None
-        self.detector = None
-        self.sequence, self.timestamp = 0, -1
+def capture_one(cap, cam_id, round_idx, out_dir):
+    ok, frame = cap.read()
+    t_epoch = time.time()
+    t_perf = time.perf_counter()
 
-    def __enter__(self):
-        import cv2
-        import mediapipe as mp
-        from mediapipe.tasks.python import vision
-        self.cv2, self.mp = cv2, mp
-        options = vision.HandLandmarkerOptions(
-            base_options=mp.tasks.BaseOptions(model_asset_path=self.args.model),
-            running_mode=vision.RunningMode.VIDEO, num_hands=self.args.hands)
-        self.detector = vision.HandLandmarker.create_from_options(options)
-        try:
-            self.camera = LatestCamera(self.args, cv2)
-        except BaseException:
-            self.detector.close()
-            raise
-        return self
+    if not ok:
+        return None
 
-    def read(self):
-        self.sequence, (frame, captured_ns) = self.camera.get(self.sequence)
-        self.timestamp = max(self.timestamp + 1, time.monotonic_ns() // 1_000_000)
-        rgb = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB)
-        start = time.monotonic()
-        result = self.detector.detect_for_video(
-            self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb), self.timestamp)
-        inference_ms = (time.monotonic() - start) * 1000
-        meta = {'id': self.args.id, 'seq': self.sequence, 'capture_unix_ns': captured_ns,
-                'inference_ms': inference_ms,
-                'landmarks': [[[p.x, p.y, p.z] for p in hand] for hand in result.hand_landmarks],
-                'world_landmarks': [[[p.x, p.y, p.z] for p in hand] for hand in result.hand_world_landmarks],
-                'handedness': [hand[0].category_name for hand in result.handedness]}
-        return frame, meta
+    filename = f"cam{cam_id}_round{round_idx:05d}.jpg"
+    filepath = os.path.join(out_dir, filename)
+    cv2.imwrite(filepath, frame)
 
-    def __exit__(self, *exc):
-        try:
-            self.camera.close()
-        finally:
-            self.detector.close()
+    return {
+        "round": round_idx,
+        "cam_id": cam_id,
+        "filename": filename,
+        "time_epoch": t_epoch,
+        "time_readable": datetime.fromtimestamp(t_epoch).strftime("%H:%M:%S.%f"),
+        "time_perf_counter": t_perf,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--master', required=True)
-    parser.add_argument('--id', type=int, choices=(2, 3), required=True)
-    parser.add_argument('--base-port', type=int, default=5000)
-    add_camera_arguments(parser)
-    parser.add_argument('--quality', type=int, default=75)
+    parser = argparse.ArgumentParser(description="3대 카메라를 0.03초 간격으로 순차 촬영")
+    parser.add_argument("--cam-indices", type=int, nargs=3, default=[0, 1, 2],
+                         help="OpenCV 카메라 인덱스 3개 (기본: 0 1 2)")
+    parser.add_argument("--interval", type=float, default=0.03,
+                         help="카메라 간 촬영 간격(초), 기본 0.03")
+    parser.add_argument("--num-rounds", type=int, default=50,
+                         help="총 몇 라운드(3대 모두 1번씩 찍는 것을 1라운드) 촬영할지")
+    parser.add_argument("--round-interval", type=float, default=0.0,
+                         help="한 라운드가 끝난 뒤 다음 라운드 시작 전 대기 시간(초)")
+    parser.add_argument("--out-dir", type=str, default="./captured_data",
+                         help="이미지와 timestamps.csv 를 저장할 폴더")
     args = parser.parse_args()
-    if not 1 <= args.fps <= 60 or not 1 <= args.quality <= 100 or not 1 <= args.base_port <= 65533:
-        parser.error('fps: 1..60, quality: 1..100, base-port: 1..65533')
-    if not Path(args.model).is_file():
-        parser.error('Model missing: run python download_model.py')
-    import cv2
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    csv_path = os.path.join(args.out_dir, "timestamps.csv")
+
+    caps = open_cameras(args.cam_indices)
+
+    fieldnames = ["round", "cam_id", "filename", "time_epoch", "time_readable", "time_perf_counter"]
+
     try:
-        with HandTracker(args) as tracker:
-            while True:
-                try:
-                    with socket.create_connection((args.master, args.base_port + args.id - 1), timeout=3) as sock:
-                        sock.settimeout(5)
-                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                        logging.info('Connected as Pi %d', args.id)
-                        while True:
-                            start = time.monotonic()
-                            frame, meta = tracker.read()
-                            ok, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, args.quality])
-                            if not ok:
-                                raise RuntimeError('JPEG encoding failed')
-                            sock.sendall(pack_frame(meta, encoded.tobytes()))
-                            if read_exact(sock, 1) != b'K':
-                                raise ConnectionError('Bad ACK')
-                            time.sleep(max(0, 1 / args.fps - (time.monotonic() - start)))
-                except (OSError, ConnectionError) as exc:
-                    logging.warning('Network disconnected: %s; retry in 1s', exc)
-                    time.sleep(1)
-    except KeyboardInterrupt:
-        pass
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for round_idx in range(args.num_rounds):
+                for order, (cap, cam_id) in enumerate(zip(caps, args.cam_indices)):
+                    record = capture_one(cap, cam_id, round_idx, args.out_dir)
+                    if record is None:
+                        print(f"[경고] round {round_idx}, cam {cam_id} 프레임 읽기 실패")
+                        continue
+
+                    writer.writerow(record)
+                    print(f"round={round_idx} cam={cam_id} time={record['time_readable']}")
+
+                    is_last_cam_in_round = (order == len(caps) - 1)
+                    if not is_last_cam_in_round:
+                        time.sleep(args.interval)
+
+                if args.round_interval > 0:
+                    time.sleep(args.round_interval)
+
+    finally:
+        for cap in caps:
+            cap.release()
+
+    print(f"\n촬영 완료. 이미지 및 timestamps.csv 저장 위치: {os.path.abspath(args.out_dir)}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
